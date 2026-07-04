@@ -17,7 +17,7 @@ import streamlit as st
 
 import config
 from agents import PlannerAgent, CoderAgent, GuardAgent, ReporterAgent
-from prompts import build_coder_prompt, build_reporter_prompt
+from prompts import build_planner_prompt, build_coder_prompt, build_reporter_prompt
 
 
 # =============================================================================
@@ -297,7 +297,9 @@ if submit_clicked and user_question.strip():
     # ===================== Step 1：Planner 拆解问题 =====================
     with st.spinner("🤔 **Step 1/4** — 需求分析师正在拆解问题 ..."):
         try:
-            sub_tasks = planner.run(question)
+            # 使用 prompts.py 统一构建提示词，传入 agent 的 run() 方法
+            planner_messages = build_planner_prompt(question)
+            sub_tasks = planner.run(question, messages=planner_messages)
 
             if not isinstance(sub_tasks, list) or len(sub_tasks) == 0:
                 st.error("❌ 需求分析师未能正确拆解问题，请尝试更具体的描述。")
@@ -352,19 +354,19 @@ if submit_clicked and user_question.strip():
             # ---- 2a: CoderAgent 生成 SQL ----
             sql = ""
             try:
-                # 构建 Coder 的输入：Schema + 子任务描述
-                coder_input = build_coder_prompt(schema_text, task)
+                # 使用 prompts.py 统一构建提示词
+                coder_messages = build_coder_prompt(schema_text, task)
 
                 # 如果是重试，附加错误修正提示
                 if attempt > 1 and task_result.get("error"):
-                    coder_input[1]["content"] += (
+                    coder_messages[1]["content"] += (
                         f"\n\n【修正提示】上一次 SQL 执行失败，请修正：\n"
                         f"错误信息：{task_result['error']}\n"
                         f"上一次 SQL：{task_result['sql']}\n"
                         f"请确保字段名与 Schema 一致，语法正确。"
                     )
 
-                sql = coder.run(coder_input[1]["content"])
+                sql = coder.run(task, messages=coder_messages)
                 sql = extract_sql(sql)
                 task_result["sql"] = sql
 
@@ -428,7 +430,6 @@ if submit_clicked and user_question.strip():
                 task_result["rows"] = rows
                 task_result["status"] = "success"
                 task_result["error"] = ""
-                sql_generated = True
 
                 with task_container:
                     st.caption(f"✅ 查询执行成功 — 返回 **{len(rows)}** 条记录")
@@ -526,9 +527,9 @@ if submit_clicked and user_question.strip():
         results_summary = "\n".join(results_parts)
 
         try:
-            # 构建 Reporter 的 messages 并调用 API
-            messages = build_reporter_prompt(question, results_summary)
-            final_report = reporter._call_api(messages, temperature=0.3)
+            # 使用 prompts.py 构建提示词，通过 reporter.run() 统一调用
+            reporter_messages = build_reporter_prompt(question, results_summary)
+            final_report = reporter.run(results_summary, messages=reporter_messages)
 
             # 用 markdown 渲染最终报告（重点数据在 prompt 中已要求加粗）
             st.markdown(final_report)

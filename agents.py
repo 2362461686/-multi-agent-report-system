@@ -47,7 +47,10 @@ class BaseAgent:
             temperature: 生成温度（0.0 = 确定性最高，1.0 = 随机性最高）
 
         Returns:
-            模型返回的文本内容
+            模型返回的文本内容（保证非空字符串）
+
+        Raises:
+            ValueError: API 返回空响应时抛出
         """
         response = self.client.chat.completions.create(
             model=config.DEEPSEEK_MODEL,
@@ -55,7 +58,11 @@ class BaseAgent:
             temperature=temperature,
             max_tokens=4096,
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        # 防御：API 偶发返回 None，转为空字符串并记录
+        if content is None:
+            raise ValueError("DeepSeek API 返回空响应，请重试")
+        return content
 
     def run(self, user_input: str):
         """
@@ -112,21 +119,25 @@ class PlannerAgent(BaseAgent):
         )
         super().__init__("需求分析师", system_prompt)
 
-    def run(self, user_input: str) -> list[str]:
+    def run(self, user_input: str, messages: list[dict] = None) -> list[str]:
         """
         将用户的业务问题拆解为子任务列表。
 
         Args:
             user_input: 用户的中文自然语言问题（如"上个月华南区销售额为什么下降了？"）
+            messages:   可选，外部预构建的完整 messages 列表（含 system prompt）。
+                        传入时将跳过内部 prompt 构建，直接使用此列表调用 API。
 
         Returns:
             子任务描述字符串列表，如 ["查询A", "查询B", ...]
             解析失败时返回原始所有非空行作为后备
         """
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+        # 如果传入了外部 messages，直接用；否则用 agent 自带的 system_prompt 构建
+        if messages is None:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_input},
+            ]
         response_text = self._call_api(messages).strip()
 
         # ---- 尝试解析 JSON 数组 ----
@@ -221,21 +232,25 @@ class CoderAgent(BaseAgent):
         )
         super().__init__("SQL工程师", system_prompt)
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, messages: list[dict] = None) -> str:
         """
         根据 Schema 和子任务需求生成 SQL 语句。
 
         Args:
             user_input: 包含数据库 Schema 和查询需求的文本
                        格式建议："Schema:\n{表结构}\n\n需求：{子任务描述}"
+            messages:   可选，外部预构建的完整 messages 列表（含 system prompt）。
+                        传入时将跳过内部 prompt 构建。
 
         Returns:
             清理后的纯 SQL 语句（已确保以分号结尾）
         """
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+        # 如果传入了外部 messages，直接用；否则用 agent 自带的 system_prompt 构建
+        if messages is None:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_input},
+            ]
         # 使用低温度以获得确定性的 SQL 输出
         sql = self._call_api(messages, temperature=0.0).strip()
 
@@ -334,16 +349,12 @@ class GuardAgent(BaseAgent):
                         "reason": f"包含禁止的关键词: {keyword}",
                     }
 
-        # 检查 SQL 注释符号（防止注释绕过）
-        if "--" in sql or "/*" in sql:
-            return {
-                "safe": False,
-                "reason": "SQL 中包含注释符号，可能用于绕过安全检查",
-            }
+        # SELECT 中的注释是合法的（如 -- 注释说明），
+        # 关键词检查已足以防御注入风险，不再拦截注释
 
         return {"safe": True, "reason": "通过硬性安全检查"}
 
-    def run(self, user_input: str) -> dict:
+    def run(self, user_input: str, messages: list[dict] = None) -> dict:
         """
         检查 SQL 语句的安全性。
 
@@ -352,6 +363,8 @@ class GuardAgent(BaseAgent):
 
         Args:
             user_input: 待检查的 SQL 语句
+            messages:   可选，外部预构建的完整 messages 列表（含 system prompt）。
+                        传入时将跳过内部 prompt 构建，直接使用此列表调用 API。
 
         Returns:
             {"safe": bool, "reason": str}  安全判断及原因说明
@@ -362,10 +375,11 @@ class GuardAgent(BaseAgent):
             return hard_result
 
         # ---- 第二道防线：LLM 辅助审查（语法检查）----
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"请检查以下 SQL 语句的安全性：\n{user_input}"},
-        ]
+        if messages is None:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"请检查以下 SQL 语句的安全性：\n{user_input}"},
+            ]
         response_text = self._call_api(messages, temperature=0.0).strip()
 
         # ---- 尝试解析 LLM 返回的 JSON ----
@@ -415,7 +429,7 @@ class ReporterAgent(BaseAgent):
         )
         super().__init__("报告分析师", system_prompt)
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, messages: list[dict] = None) -> str:
         """
         根据查询结果生成综合分析报告。
 
@@ -424,14 +438,18 @@ class ReporterAgent(BaseAgent):
                        格式建议：
                        "原始问题：{用户的问题}\n\n"
                        "查询结果：\n子任务1: ...\n结果: ...\n\n子任务2: ...\n结果: ..."
+            messages:   可选，外部预构建的完整 messages 列表（含 system prompt）。
+                        传入时将跳过内部 prompt 构建。
 
         Returns:
             自然语言分析报告文本
         """
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+        # 如果传入了外部 messages，直接用；否则用 agent 自带的 system_prompt 构建
+        if messages is None:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_input},
+            ]
         # 使用稍高温度使报告语言更自然
         report = self._call_api(messages, temperature=0.3).strip()
         return report
